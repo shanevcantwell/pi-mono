@@ -68,6 +68,33 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("custom result");
 	});
 
+	test("falls back to persisted result text when renderResult returns undefined", () => {
+		const toolDefinition: ToolDefinition = {
+			...createBaseToolDefinition(),
+			renderCall: () => new Text("custom call", 0, 0),
+			renderResult: () => undefined as unknown as Text,
+		};
+		const component = new ToolExecutionComponent(
+			"custom_tool",
+			"tool-undefined-result-renderer",
+			{},
+			{},
+			toolDefinition,
+			createFakeTui(),
+			process.cwd(),
+		);
+
+		let rendered = "";
+		expect(() => {
+			component.updateResult(
+				{ content: [{ type: "text", text: "persisted result" }], details: {}, isError: false },
+				false,
+			);
+			rendered = stripAnsi(component.render(120).join("\n"));
+		}).not.toThrow();
+		expect(rendered).toContain("persisted result");
+	});
+
 	test("self-rendered empty tool rows take no layout space", () => {
 		const toolDefinition: ToolDefinition = {
 			...createBaseToolDefinition(),

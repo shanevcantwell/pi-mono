@@ -337,15 +337,18 @@ export class ToolExecutionComponent extends Container {
 					}
 				} else {
 					try {
-						const component = resultRenderer(
+						const renderedComponent = resultRenderer(
 							{ content: this.result.content as any, details: this.result.details },
 							{ expanded: this.expanded, isPartial: this.isPartial },
 							theme,
 							this.getRenderContext(this.resultRendererComponent),
 						);
-						this.resultRendererComponent = component;
-						renderContainer.addChild(this.createResultRegion(component));
-						hasContent = true;
+						this.resultRendererComponent = renderedComponent || undefined;
+						const component = renderedComponent || this.createResultFallback();
+						if (component) {
+							renderContainer.addChild(this.createResultRegion(component));
+							hasContent = true;
+						}
 					} catch {
 						this.resultRendererComponent = undefined;
 						const component = this.createResultFallback();
