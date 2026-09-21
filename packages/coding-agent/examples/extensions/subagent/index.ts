@@ -24,6 +24,7 @@ import {
 	type ExtensionAPI,
 	getAgentDir,
 	getMarkdownTheme,
+	terminateOwnedDetachedChild,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
@@ -345,6 +346,7 @@ async function runSingleAgent(
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
+				detached: process.platform !== "win32",
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
@@ -398,23 +400,28 @@ async function runSingleAgent(
 				currentResult.stderr += data.toString();
 			});
 
+			let settled = false;
+			const finish = (code: number) => {
+				if (settled) return;
+				settled = true;
+				signal?.removeEventListener("abort", killProc);
+				resolve(code);
+			};
+			const killProc = () => {
+				wasAborted = true;
+				void terminateOwnedDetachedChild({ child: proc, detachedOnUnix: true }).finally(() => finish(1));
+			};
+
 			proc.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				finish(code ?? 0);
 			});
 
 			proc.on("error", () => {
-				resolve(1);
+				finish(1);
 			});
 
 			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
 				if (signal.aborted) killProc();
 				else signal.addEventListener("abort", killProc, { once: true });
 			}

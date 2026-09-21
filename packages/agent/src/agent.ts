@@ -294,7 +294,7 @@ export class Agent {
 		return this.followUpQueue.mode;
 	}
 
-	/** Queue a message to be injected after the current assistant turn finishes. */
+	/** Queue a correction for the next safe tool boundary, skipping pending calls in the invalidated batch. */
 	steer(message: AgentMessage): void {
 		this.steeringQueue.enqueue(message);
 	}

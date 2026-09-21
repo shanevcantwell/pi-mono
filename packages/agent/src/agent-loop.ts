@@ -170,6 +170,7 @@ async function runLoop(
 	let currentContext = initialContext;
 	let config = initialConfig;
 	let lastCompletedTurn: PrepareNextTurnContext | undefined;
+	let deferredFollowUpMessages: AgentMessage[] = [];
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
@@ -228,17 +229,24 @@ async function runLoop(
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 
 			const toolResults: ToolResultMessage[] = [];
+			let steeringMessages: AgentMessage[] | undefined;
 			hasMoreToolCalls = false;
 			if (toolCalls.length > 0) {
+				// Steering typed while the model was streaming invalidates the entire tool
+				// batch before any call acquires execution or preflight authority.
+				const steeringBeforeTools = (await config.getSteeringMessages?.()) ?? [];
 				// A "length" stop means the output was cut off by the token limit, so
 				// every tool call in the message may carry truncated arguments. Fail
 				// them all instead of executing potentially borked calls.
 				const executedToolBatch =
-					message.stopReason === "length"
-						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
-						: await executeToolCalls(currentContext, message, config, signal, emit);
+					steeringBeforeTools.length > 0
+						? await skipToolCallsBeforeStart(toolCalls, steeringBeforeTools, emit)
+						: message.stopReason === "length"
+							? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+							: await executeToolCalls(currentContext, message, config, signal, emit);
 				toolResults.push(...executedToolBatch.messages);
 				hasMoreToolCalls = !executedToolBatch.terminate;
+				steeringMessages = executedToolBatch.steeringMessages;
 
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
@@ -248,6 +256,14 @@ async function runLoop(
 
 			await emit({ type: "turn_end", message, toolResults });
 
+			// A boundary poll that returned nothing must not consume the post-turn
+			// opportunity. In particular, steering queued by a turn_end subscriber
+			// must override a terminating tool result and trigger replanning.
+			if (!steeringMessages?.length) {
+				const postTurnSteering = (await config.getSteeringMessages?.()) ?? [];
+				if (postTurnSteering.length > 0) steeringMessages = postTurnSteering;
+			}
+
 			lastCompletedTurn = {
 				message,
 				toolResults,
@@ -255,16 +271,44 @@ async function runLoop(
 				newMessages,
 			};
 
-			if (await config.shouldStopAfterTurn?.(lastCompletedTurn)) {
+			let shouldStop = false;
+			if (config.shouldStopAfterTurn) {
+				shouldStop = await config.shouldStopAfterTurn(lastCompletedTurn);
+				// The stop decision is stale if steering arrived while the callback was
+				// running. Poll at the callback boundary unless an earlier poll already
+				// captured work that keeps the loop alive.
+				if (!steeringMessages?.length) {
+					const steeringAfterStopCheck = (await config.getSteeringMessages?.()) ?? [];
+					if (steeringAfterStopCheck.length > 0) steeringMessages = steeringAfterStopCheck;
+				}
+			}
+			if (shouldStop && !steeringMessages?.length) {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
 
-			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			pendingMessages = steeringMessages ?? [];
+		}
+
+		if (deferredFollowUpMessages.length > 0) {
+			pendingMessages = deferredFollowUpMessages;
+			deferredFollowUpMessages = [];
+			continue;
 		}
 
 		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
+		if (config.getFollowUpMessages) {
+			// Steering has priority over follow-ups, including messages queued while
+			// the follow-up callback was running. Keep drained follow-ups local until
+			// the steering turn completes so their wait-until-finished semantics hold.
+			const steeringAfterFollowUp = (await config.getSteeringMessages?.()) ?? [];
+			if (steeringAfterFollowUp.length > 0) {
+				pendingMessages = steeringAfterFollowUp;
+				deferredFollowUpMessages = followUpMessages;
+				continue;
+			}
+		}
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages;
@@ -481,7 +525,24 @@ async function executeToolCalls(
 type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
 	terminate: boolean;
+	/** Undefined means no steering message was captured while executing this batch. */
+	steeringMessages?: AgentMessage[];
 };
+
+async function skipToolCallsBeforeStart(
+	toolCalls: AgentToolCall[],
+	steeringMessages: AgentMessage[],
+	emit: AgentEventSink,
+): Promise<ExecutedToolCallBatch> {
+	const messages: ToolResultMessage[] = [];
+	for (const toolCall of toolCalls) {
+		const skipped = await skipToolCall(toolCall, emit, false);
+		const message = createToolResultMessage(skipped);
+		await emitToolResultMessage(message, emit);
+		messages.push(message);
+	}
+	return { messages, terminate: false, steeringMessages };
+}
 
 async function executeToolCallsSequential(
 	currentContext: AgentContext,
@@ -493,8 +554,30 @@ async function executeToolCallsSequential(
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
+	let steeringMessages: AgentMessage[] | undefined;
 
-	for (const toolCall of toolCalls) {
+	for (let index = 0; index < toolCalls.length; index++) {
+		const toolCall = toolCalls[index];
+		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+
+		// Awaited preflight is the active atomic boundary. Steering queued while it
+		// ran invalidates this not-yet-executed call and every later call before an
+		// execution-start event or tool body can acquire authority.
+		if (!signal?.aborted && config.getSteeringMessages) {
+			const steering = await config.getSteeringMessages();
+			if (steering.length > 0) {
+				steeringMessages = steering;
+				for (const skipped of toolCalls.slice(index)) {
+					const skippedOutcome = await skipToolCall(skipped, emit, false);
+					finalizedCalls.push(skippedOutcome);
+					const skippedMessage = createToolResultMessage(skippedOutcome);
+					await emitToolResultMessage(skippedMessage, emit);
+					messages.push(skippedMessage);
+				}
+				break;
+			}
+		}
+
 		await emit({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
@@ -502,7 +585,6 @@ async function executeToolCallsSequential(
 			args: toolCall.arguments,
 		});
 
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		let finalized: FinalizedToolCallOutcome;
 		if (preparation.kind === "immediate") {
 			finalized = {
@@ -529,13 +611,36 @@ async function executeToolCallsSequential(
 		messages.push(toolResultMessage);
 
 		if (signal?.aborted) {
+			for (const skipped of toolCalls.slice(index + 1)) {
+				const skippedOutcome = skipToolCallAfterAbort(skipped);
+				finalizedCalls.push(skippedOutcome);
+				const skippedMessage = createToolResultMessage(skippedOutcome);
+				await emitToolResultMessage(skippedMessage, emit);
+				messages.push(skippedMessage);
+			}
 			break;
+		}
+
+		if (config.getSteeringMessages) {
+			const steering = await config.getSteeringMessages();
+			if (steering.length > 0) {
+				steeringMessages = steering;
+				for (const skipped of toolCalls.slice(index + 1)) {
+					const skippedOutcome = await skipToolCall(skipped, emit, false);
+					finalizedCalls.push(skippedOutcome);
+					const skippedMessage = createToolResultMessage(skippedOutcome);
+					await emitToolResultMessage(skippedMessage, emit);
+					messages.push(skippedMessage);
+				}
+				break;
+			}
 		}
 	}
 
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(finalizedCalls),
+		steeringMessages,
 	};
 }
 
@@ -547,9 +652,11 @@ async function executeToolCallsParallel(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
-	const finalizedCalls: FinalizedToolCallEntry[] = [];
+	const preflightOutcomes: Array<FinalizedToolCallOutcome | PreparedToolCall> = [];
+	let steeringMessages: AgentMessage[] | undefined;
 
-	for (const toolCall of toolCalls) {
+	for (let toolIndex = 0; toolIndex < toolCalls.length; toolIndex++) {
+		const toolCall = toolCalls[toolIndex];
 		await emit({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
@@ -557,6 +664,8 @@ async function executeToolCallsParallel(
 			args: toolCall.arguments,
 		});
 
+		// Preflight is atomic once started. Poll only after it settles, before the
+		// next call can emit a start event or invoke its beforeToolCall hook.
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		if (preparation.kind === "immediate") {
 			const finalized = {
@@ -565,43 +674,65 @@ async function executeToolCallsParallel(
 				isError: preparation.isError,
 			} satisfies FinalizedToolCallOutcome;
 			await emitToolExecutionEnd(finalized, emit);
-			finalizedCalls.push(finalized);
-			if (signal?.aborted) {
-				break;
-			}
-			continue;
+			preflightOutcomes.push(finalized);
+		} else {
+			preflightOutcomes.push(preparation);
 		}
 
-		finalizedCalls.push(async () => {
+		if (signal?.aborted) {
+			for (const pending of toolCalls.slice(toolIndex + 1)) {
+				preflightOutcomes.push(skipToolCallAfterAbort(pending));
+			}
+			break;
+		}
+
+		if (config.getSteeringMessages) {
+			// Let producers that were resumed by tool_execution_start finish queueing
+			// their current microtask before this boundary drains the queue.
+			await Promise.resolve();
+			const steering = await config.getSteeringMessages();
+			if (steering.length > 0) {
+				steeringMessages = steering;
+				for (let outcomeIndex = 0; outcomeIndex < preflightOutcomes.length; outcomeIndex++) {
+					const outcome = preflightOutcomes[outcomeIndex];
+					if (!("result" in outcome)) {
+						preflightOutcomes[outcomeIndex] = await skipToolCall(outcome.toolCall, emit, true);
+					}
+				}
+				for (const pending of toolCalls.slice(toolIndex + 1)) {
+					preflightOutcomes.push(await skipToolCall(pending, emit, false));
+				}
+				break;
+			}
+		}
+	}
+
+	const orderedFinalizedCalls = await Promise.all(
+		preflightOutcomes.map(async (outcome): Promise<FinalizedToolCallOutcome> => {
+			if ("result" in outcome) return outcome;
 			if (signal?.aborted) {
 				const finalized = {
-					toolCall,
-					result: createErrorToolResult("Operation aborted"),
+					toolCall: outcome.toolCall,
+					result: createErrorToolResult("Operation aborted before tool execution started."),
 					isError: true,
 				} satisfies FinalizedToolCallOutcome;
 				await emitToolExecutionEnd(finalized, emit);
 				return finalized;
 			}
-			const executed = await executePreparedToolCall(preparation, signal, emit);
+			const executed = await executePreparedToolCall(outcome, signal, emit);
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
-				preparation,
+				outcome,
 				executed,
 				config,
 				signal,
 			);
 			await emitToolExecutionEnd(finalized, emit);
 			return finalized;
-		});
-		if (signal?.aborted) {
-			break;
-		}
-	}
-
-	const orderedFinalizedCalls = await Promise.all(
-		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+		}),
 	);
+
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
 		const toolResultMessage = createToolResultMessage(finalized);
@@ -612,6 +743,7 @@ async function executeToolCallsParallel(
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		steeringMessages,
 	};
 }
 
@@ -638,8 +770,6 @@ type FinalizedToolCallOutcome = {
 	result: AgentToolResult<any>;
 	isError: boolean;
 };
-
-type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
 
 function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
 	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);
@@ -834,6 +964,28 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 		result: finalized.result,
 		isError: finalized.isError,
 	});
+}
+
+async function skipToolCall(
+	toolCall: AgentToolCall,
+	emit: AgentEventSink,
+	executionStarted: boolean,
+): Promise<FinalizedToolCallOutcome> {
+	const finalized = {
+		toolCall,
+		result: createErrorToolResult("Skipped because a steering message invalidated this tool batch."),
+		isError: true,
+	} satisfies FinalizedToolCallOutcome;
+	if (executionStarted) await emitToolExecutionEnd(finalized, emit);
+	return finalized;
+}
+
+function skipToolCallAfterAbort(toolCall: AgentToolCall): FinalizedToolCallOutcome {
+	return {
+		toolCall,
+		result: createErrorToolResult("Skipped because the operation was aborted before this tool call started."),
+		isError: true,
+	};
 }
 
 function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {

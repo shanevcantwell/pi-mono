@@ -219,8 +219,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Called after each turn fully completes and `turn_end` has been emitted.
 	 *
-	 * If it returns true, the loop emits `agent_end` and exits before polling steering or follow-up queues,
-	 * without starting another LLM call. The current assistant response and any tool executions finish normally.
+	 * If it returns true, the loop emits `agent_end` and exits before polling follow-up queues or starting another
+	 * LLM call, unless steering was already captured at a safe tool boundary and must be delivered. The current
+	 * assistant response and any active tool executions finish normally.
 	 * This callback sees the completed-turn context and runs before `prepareNextTurn`.
 	 *
 	 * Use this to request a graceful stop after the current turn, e.g. before context gets too full.
@@ -241,9 +242,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
-	 * Called after the current assistant turn finishes executing its tool calls, unless `shouldStopAfterTurn` exits first.
-	 * If messages are returned, they are added to the context before the next LLM call.
-	 * Tool calls from the current assistant message are not skipped.
+	 * Called at safe tool boundaries and after the current assistant turn finishes executing its tool calls.
+	 * If messages are returned, pending tool calls that have not
+	 * started are skipped with protocol-valid error results, and the messages are added to the context before
+	 * the next LLM call. Already-running parallel calls are allowed to finish.
 	 *
 	 * Use this for "steering" the agent while it's working.
 	 *

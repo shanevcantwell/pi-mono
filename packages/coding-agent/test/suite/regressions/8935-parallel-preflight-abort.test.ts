@@ -67,6 +67,9 @@ describe("#8935 parallel preflight abort", () => {
 
 		const toolResults = harness.session.messages.filter((message) => message.role === "toolResult");
 		expect(toolResults.map((message) => message.toolCallId)).toEqual(starts.map((event) => event.toolCallId));
-		expect(toolResults.map(getMessageText)).toEqual(["Operation aborted", "Operation aborted"]);
+		expect(toolResults.map(getMessageText)).toEqual([
+			"Operation aborted before tool execution started.",
+			"Operation aborted",
+		]);
 	});
 });

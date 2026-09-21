@@ -1470,7 +1470,7 @@ pi.sendMessage({
 
 **Options:**
 - `deliverAs` - Delivery mode:
-  - `"steer"` (default) - Queues the message while streaming. Delivered after the current assistant turn finishes executing its tool calls, before the next LLM call.
+  - `"steer"` (default) - Queues the message while streaming. At the next safe tool boundary, pending calls from that assistant batch are skipped and the message is delivered before the next LLM call.
   - `"followUp"` - Waits for agent to finish. Delivered only when agent has no more tool calls.
   - `"nextTurn"` - Queued for next user prompt. Does not interrupt or trigger anything.
 - `triggerTurn: true` - If agent is idle, trigger an LLM response immediately. Only applies to `"steer"` and `"followUp"` modes (ignored for `"nextTurn"`).
@@ -1499,7 +1499,7 @@ pi.sendUserMessage("/review src/index.ts", { expandPromptTemplates: true });
 
 **Options:**
 - `deliverAs` - Required when agent is streaming:
-  - `"steer"` - Queues the message for delivery after the current assistant turn finishes executing its tool calls
+  - `"steer"` - Queues the message for delivery at the next safe tool boundary, skipping pending calls from that assistant batch
   - `"followUp"` - Waits for agent to finish all tools
 - `expandPromptTemplates` - Dispatch extension commands and expand skill commands and prompt templates. Defaults to `false`.
 

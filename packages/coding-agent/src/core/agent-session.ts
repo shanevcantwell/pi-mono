@@ -1561,8 +1561,8 @@ export class AgentSession {
 
 	/**
 	 * Queue a steering message while the agent is running.
-	 * Delivered after the current assistant turn finishes executing its tool calls,
-	 * before the next LLM call.
+	 * Delivered at the next safe tool boundary. Pending calls from the current assistant batch
+	 * are skipped before the next LLM call; already-running parallel calls finish first.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
 	 * @param options Input source; defaults to interactive

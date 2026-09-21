@@ -8,8 +8,8 @@ import { waitForChildProcess } from "../../utils/child-process.ts";
 import {
 	getShellConfig,
 	getShellEnv,
-	killProcessTree,
 	type ShellConfig,
+	terminateOwnedDetachedChild,
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
@@ -108,7 +108,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			let timedOut = false;
 			let timeoutHandle: NodeJS.Timeout | undefined;
 			const onAbort = () => {
-				if (child.pid) killProcessTree(child.pid);
+				void terminateOwnedDetachedChild({ child, detachedOnUnix: true });
 			};
 
 			try {
@@ -116,7 +116,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 				if (timeoutMs !== undefined) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
-						if (child.pid) killProcessTree(child.pid);
+						void terminateOwnedDetachedChild({ child, detachedOnUnix: true });
 					}, timeoutMs);
 				}
 				// Stream stdout and stderr.

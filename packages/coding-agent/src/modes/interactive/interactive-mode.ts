@@ -4078,6 +4078,20 @@ export class InteractiveMode {
 	// =========================================================================
 
 	private handleCtrlC(): void {
+		// While work is active, Ctrl-C is an interrupt just like Escape. Keep the
+		// idle clear/double-press-exit behavior below, but never require an operator
+		// to clear the editor before an active response or tool can be aborted.
+		if (this.session.isStreaming) {
+			this.lastSigintTime = 0;
+			this.restoreQueuedMessagesToEditor({ abort: true });
+			return;
+		}
+		if (this.session.isBashRunning) {
+			this.lastSigintTime = 0;
+			this.session.abortBash();
+			return;
+		}
+
 		const now = Date.now();
 		if (now - this.lastSigintTime < 500) {
 			void this.shutdown();

@@ -547,6 +547,74 @@ describe("Coding Agent Tools", () => {
 			await expect(bashTool.execute("test-call-10", { command, timeout: 0.05 })).rejects.toThrow(/timed out/i);
 		});
 
+		it.skipIf(process.platform === "win32")("should abort the active shell process tree", async () => {
+			const wrapperPidPath = join(testDir, "wrapper.pid");
+			const childPidPath = join(testDir, "child.pid");
+			const heartbeatPath = join(testDir, "child.heartbeat");
+			const childScript = `const fs = require("node:fs"); setInterval(() => fs.appendFileSync(${JSON.stringify(heartbeatPath)}, "."), 10);`;
+			const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(childScript)} & child_pid=$!; printf 'PI_TEST_PIDS:%s:%s\\n' "$$" "$child_pid"; printf '%s' "$$" > ${JSON.stringify(wrapperPidPath)}; printf '%s' "$child_pid" > ${JSON.stringify(childPidPath)}; wait "$child_pid"`;
+			const controller = new AbortController();
+			let pidOutput = "";
+			let wrapperPid: number | undefined;
+			let childPid: number | undefined;
+			const execution = createLocalBashOperations().exec(command, testDir, {
+				onData: (data) => {
+					pidOutput += data.toString("utf8");
+					const match = pidOutput.match(/PI_TEST_PIDS:(\d+):(\d+)/);
+					if (match) {
+						wrapperPid = Number(match[1]);
+						childPid = Number(match[2]);
+					}
+				},
+				signal: controller.signal,
+			});
+			let executionSettled = false;
+			const settledExecution = execution.then(
+				() => {
+					executionSettled = true;
+				},
+				() => {
+					executionSettled = true;
+				},
+			);
+
+			try {
+				for (let attempt = 0; attempt < 100 && (wrapperPid === undefined || childPid === undefined); attempt++) {
+					await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+				if (wrapperPid === undefined && existsSync(wrapperPidPath)) {
+					wrapperPid = Number(readFileSync(wrapperPidPath, "utf8"));
+				}
+				if (childPid === undefined && existsSync(childPidPath)) {
+					childPid = Number(readFileSync(childPidPath, "utf8"));
+				}
+				expect(wrapperPid).toEqual(expect.any(Number));
+				expect(childPid).toEqual(expect.any(Number));
+				controller.abort();
+				await expect(execution).rejects.toThrow("aborted");
+
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				const heartbeatAfterAbort = existsSync(heartbeatPath) ? readFileSync(heartbeatPath).length : 0;
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				const finalHeartbeat = existsSync(heartbeatPath) ? readFileSync(heartbeatPath).length : 0;
+				expect(finalHeartbeat).toBe(heartbeatAfterAbort);
+			} finally {
+				controller.abort();
+				// Emergency cleanup is deliberately independent of terminateOwnedDetachedChild.
+				// Kill both known identities so a broken group kill cannot leak a heartbeat process.
+				for (const pid of [childPid, wrapperPid]) {
+					if (pid === undefined) continue;
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {
+						// The expected path may already have terminated this process.
+					}
+				}
+				await Promise.race([settledExecution, new Promise<void>((resolve) => setTimeout(resolve, 2000))]);
+				expect(executionSettled).toBe(true);
+			}
+		});
+
 		it("should include full output path for truncated timeout and abort errors", async () => {
 			for (const testCase of [
 				{ error: "timeout:5", expected: "Command timed out after 5 seconds" },

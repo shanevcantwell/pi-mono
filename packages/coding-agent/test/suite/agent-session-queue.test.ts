@@ -251,8 +251,20 @@ describe("AgentSession queue characterization", () => {
 		]);
 	});
 
-	it("delivers all steering messages in one batch in all mode", async () => {
-		const waiting = await createWaitingHarness();
+	it("delivers all steering messages queued before a boundary in one batch in all mode", async () => {
+		let releasePreflight: (() => void) | undefined;
+		const preflightGate = new Promise<void>((resolve) => {
+			releasePreflight = resolve;
+		});
+		const waiting = await createWaitingHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("tool_call", async (event) => {
+						if (event.toolName === "wait") await preflightGate;
+					});
+				},
+			],
+		});
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
 		harnesses.push(harness);
 		harness.session.setSteeringMode("all");
@@ -271,6 +283,7 @@ describe("AgentSession queue characterization", () => {
 		await waitForToolStart;
 		await harness.session.steer("steer 1");
 		await harness.session.steer("steer 2");
+		releasePreflight?.();
 		releaseToolExecution();
 		await promptPromise;
 

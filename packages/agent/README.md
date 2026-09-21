@@ -145,7 +145,7 @@ const stream = agentLoop(
 );
 ```
 
-`shouldStopAfterTurn` runs after `turn_end` is emitted and after the assistant response and any tool executions have completed normally. If it returns `true`, the loop emits `agent_end` and exits before polling steering or follow-up queues, and before starting another LLM call. It does not abort the provider stream, does not cancel running tools, and does not alter the assistant message stop reason. The `AgentOptions` callback also receives the active run's `AbortSignal` as its second argument.
+`shouldStopAfterTurn` runs after `turn_end` is emitted and after the assistant response and any active tool executions have completed normally. If it returns `true`, the loop emits `agent_end` and exits before polling follow-up queues or starting another LLM call, unless steering was already captured at a safe tool boundary and must be delivered. It does not abort the provider stream, does not cancel running tools, and does not alter the assistant message stop reason. The `AgentOptions` callback also receives the active run's `AbortSignal` as its second argument.
 
 When you use the `Agent` class, assistant `message_end` processing is treated as a barrier before tool preflight begins. That means `beforeToolCall` sees agent state that already includes the assistant message that requested the tool call.
 
@@ -381,10 +381,10 @@ agent.clearAllQueues();
 
 Use clearSteeringQueue, clearFollowUpQueue, or clearAllQueues to drop queued messages.
 
-When steering messages are detected after a turn completes:
-1. All tool calls from the current assistant message have already finished
-2. Steering messages are injected
-3. The LLM responds on the next turn
+When steering messages are detected at a safe tool boundary:
+1. The active tool finishes; already-running parallel tools are also allowed to finish
+2. Pending calls from the current assistant batch are skipped with error tool results
+3. Steering messages are injected and the LLM replans on the next turn
 
 Follow-up messages are checked only when there are no more tool calls and no steering messages. If any are queued, they are injected and another turn runs.
 

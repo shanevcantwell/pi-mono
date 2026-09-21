@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { delimiter, join } from "node:path";
-import { spawn, spawnSync } from "child_process";
+import { type ChildProcess, spawn, spawnSync } from "child_process";
 import { getBinDir } from "../config.ts";
 
 export interface ShellConfig {
@@ -205,43 +205,106 @@ export function untrackDetachedChildPid(pid: number): void {
 
 export function killTrackedDetachedChildren(): void {
 	for (const pid of trackedDetachedChildPids) {
-		killProcessTree(pid);
+		void killProcessTree(pid);
 	}
 	trackedDetachedChildPids.clear();
 }
 
+const TASKKILL_TIMEOUT_MS = 1000;
+
 /**
- * Kill a process and all its children (cross-platform)
+ * Terminate a Pi-owned detached process group by its leader PID.
+ *
+ * Precondition: `pid` came from a child spawned by Pi with `detached: true` on Unix.
+ * This helper stays internal because a negative Unix PID targets a process group.
  */
-export function killProcessTree(pid: number): void {
+async function killProcessTree(pid: number): Promise<boolean> {
 	if (process.platform === "win32") {
-		// Use the trusted System32 executable so cleanup does not depend on PATH.
-		try {
-			const child = spawn(
-				join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
-				["/F", "/T", "/PID", String(pid)],
-				{
-					stdio: "ignore",
-					detached: true,
-					windowsHide: true,
-				},
-			);
-			// A failed spawn emits "error" asynchronously; consume it to avoid crashing Node.
-			child.once("error", () => {});
-		} catch {
-			// Ignore errors if taskkill fails.
-		}
-	} else {
-		// Use SIGKILL on Unix/Linux/Mac
-		try {
-			process.kill(-pid, "SIGKILL");
-		} catch {
-			// Fallback to killing just the child if process group kill fails
+		return await new Promise<boolean>((resolve) => {
+			let settled = false;
+			let taskkill: ChildProcess | undefined;
+			const finish = (success: boolean, terminateHelper = false) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeout);
+				if (terminateHelper && taskkill) {
+					try {
+						taskkill.kill("SIGKILL");
+					} catch {
+						// The helper may have exited between the timeout and termination attempt.
+					}
+					try {
+						taskkill.unref();
+					} catch {
+						// Always settle so helper cleanup failures cannot block child fallback.
+					}
+				}
+				resolve(success);
+			};
+			const timeout = setTimeout(() => finish(false, true), TASKKILL_TIMEOUT_MS);
+			timeout.unref();
 			try {
-				process.kill(pid, "SIGKILL");
+				taskkill = spawn(
+					join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"),
+					["/F", "/T", "/PID", String(pid)],
+					{
+						stdio: "ignore",
+						detached: true,
+						windowsHide: true,
+					},
+				);
+				taskkill.once("error", () => finish(false));
+				taskkill.once("close", (code) => finish(code === 0));
 			} catch {
-				// Process already dead
+				finish(false);
 			}
+		});
+	}
+
+	try {
+		process.kill(-pid, "SIGKILL");
+		return true;
+	} catch {
+		try {
+			process.kill(pid, "SIGKILL");
+			return true;
+		} catch {
+			return false;
 		}
+	}
+}
+
+export interface OwnedDetachedChildProcess {
+	/** Child process owned by the caller and safe to terminate. */
+	child: ChildProcess;
+	/** Confirms that this child was spawned with `detached: true` on Unix. */
+	detachedOnUnix: true;
+}
+
+/**
+ * Terminate a caller-owned child and its descendants.
+ *
+ * On Unix this sends a signal to `-child.pid`, so the child must have been
+ * spawned with `detached: true` and must be owned by the caller. The options
+ * object makes that process-group precondition explicit at every call site.
+ * On Windows the child need not be detached; `taskkill /T` performs tree cleanup.
+ * Returns whether a tree kill succeeded or the direct child accepted SIGKILL.
+ */
+export async function terminateOwnedDetachedChild({
+	child,
+	detachedOnUnix,
+}: OwnedDetachedChildProcess): Promise<boolean> {
+	if (detachedOnUnix !== true) {
+		throw new Error("terminateOwnedDetachedChild requires a child spawned with detached: true on Unix");
+	}
+	if (child.exitCode !== null || child.signalCode !== null) return true;
+
+	const treeTerminated = child.pid ? await killProcessTree(child.pid) : false;
+	if (treeTerminated || child.exitCode !== null || child.signalCode !== null) return true;
+
+	try {
+		return child.kill("SIGKILL");
+	} catch {
+		return false;
 	}
 }

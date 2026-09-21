@@ -225,7 +225,7 @@ See `/hotkeys` for the full list. Customize via `~/.pi/agent/keybindings.json`. 
 
 Submit messages while the agent is working:
 
-- **Enter** queues a *steering* message, delivered after the current assistant turn finishes executing its tool calls
+- **Enter** queues a *steering* message; at the next safe tool boundary, pending calls from that assistant batch are skipped so the model can replan
 - **Alt+Enter** queues a *follow-up* message, delivered only after the agent finishes all work
 - **Escape** aborts and restores queued messages to editor
 - **Alt+Up** retrieves queued messages back to editor
